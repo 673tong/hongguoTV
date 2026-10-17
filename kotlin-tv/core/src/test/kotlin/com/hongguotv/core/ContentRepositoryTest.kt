@@ -244,4 +244,78 @@ class ContentRepositoryTest {
         assertEquals("456",repo.search("短剧",1,ContentType.SHORT).items.single().id)
         assertEquals(2,paths.size)
     }
+
+    // --- 播放链路：公开 360p 优先，DASH 区间解析 ---
+
+    private fun playbackRepository(respond: (Request) -> Pair<Int,String>) = ContentRepository(
+        OkHttpClient.Builder().addInterceptor { chain ->
+            val (code,body)=respond(chain.request())
+            Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1)
+                .code(code).message("OK").body(body.toResponseBody()).build()
+        }.build()
+    )
+
+    @Test fun publicMp4WinsWithoutProbingPlayInfo() {
+        val paths=mutableListOf<String>()
+        val repo=playbackRepository { request ->
+            paths+=request.url.encodedPath
+            when {
+                request.url.encodedPath.endsWith("/360p.mp4") -> 206 to ""
+                else -> 200 to """{"base_resp":{"StatusCode":0},"play_info":{"main_url":"https://cdn.example.com/v.mp4","definition":"720p","format":"dash"}}"""
+            }
+        }
+        val result=repo.stream("123",1080,"999")
+        assertEquals("https://hongguoduanju.com/video/public/123/360p.mp4",result.url)
+        assertEquals("360P（网页版）",result.quality)
+        assertNull(result.key); assertNull(result.audioUrl)
+        assertEquals(listOf("/video/public/123/360p.mp4"),paths)
+    }
+
+    @Test fun cdnThatIgnoresRangeFallsBackToTheSignedPath() {
+        val repo=playbackRepository { 200 to "" }
+        // 两条链路都不可用时应抛错，而不是把 200 的整段响应当成可播放流。
+        assertThrows(IOException::class.java) { repo.stream("123",1080,"999") }
+    }
+
+    @Test fun dashPlayInfoExposesSeparateRangesForBothTracks() {
+        val repo=playbackRepository { request ->
+            if(request.url.encodedPath.endsWith("/360p.mp4")) 404 to ""
+            else 200 to """{"base_resp":{"StatusCode":0},"play_info":{
+                "main_url":"https://cdn.example.com/v.mp4","definition":"720p","format":"dash",
+                "init_range":"0-1234","index_range":"1235-1686",
+                "audio":{"main_url":"https://cdn.example.com/a.mp4","init_range":"0-1026","index_range":"1027-1478"}}}"""
+        }
+        val result=repo.playInfo("123","999",1080)
+        assertEquals("https://cdn.example.com/v.mp4",result.url)
+        assertEquals("https://cdn.example.com/a.mp4",result.audioUrl)
+        assertEquals("720P",result.quality)
+        assertEquals(0L..1234L,result.initRange)
+        assertEquals(1235L..1686L,result.indexRange)
+        assertEquals(0L..1026L,result.audioInitRange)
+        assertEquals(1027L..1478L,result.audioIndexRange)
+    }
+
+    @Test fun dashPlayInfoRejectsSeparateVideoWithoutAudioTrack() {
+        // 没有音轨的分离流播放必然无声，直接判为不可用。
+        val repo=playbackRepository {
+            200 to """{"base_resp":{"StatusCode":0},"play_info":{"main_url":"https://cdn.example.com/v.mp4","definition":"720p","format":"dash"}}"""
+        }
+        assertThrows(IOException::class.java) { repo.playInfo("123","999",1080) }
+    }
+
+    @Test fun playInfoRequiresSeriesIdBecauseTheEndpointRejectsItOtherwise() {
+        val repo=playbackRepository { 200 to "{}" }
+        assertThrows(IllegalArgumentException::class.java) { repo.playInfo("123","",720) }
+    }
+
+    @Test fun parseRangeAcceptsOnlyWellFormedAscendingPairs() {
+        assertEquals(0L..1234L,ContentRepository.parseRange("0-1234"))
+        assertEquals(1235L..1686L,ContentRepository.parseRange(" 1235-1686 "))
+        assertEquals(7L..7L,ContentRepository.parseRange("7-7"))
+        assertNull(ContentRepository.parseRange(""))
+        assertNull(ContentRepository.parseRange("1686-1235"))
+        assertNull(ContentRepository.parseRange("bytes=0-1234"))
+        assertNull(ContentRepository.parseRange("0-"))
+        assertNull(ContentRepository.parseRange("0-1234567890123"))
+    }
 }

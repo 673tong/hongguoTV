@@ -36,3 +36,6 @@ keystore.properties
 .externalNativeBuild/
 /ios/Pods/
 /ios/build/
+
+# Local agent workspace data
+.workbuddy/

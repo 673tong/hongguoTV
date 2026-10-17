@@ -21,7 +21,7 @@ data class Detail(val series: Series, val episodes: List<String>)
 data class RankPosition(val rank: Int?, val heat: String)
 data class ComicRanking(val positions: Map<String,RankPosition>, val totalPages: Int, val updatedText: String)
 data class CatalogPage(val items: List<Series>, val hasMore: Boolean, val ranking: ComicRanking? = null)
-data class StreamInfo(val url: String, val key: ByteArray?, val quality: String)
+data class StreamInfo(val url: String, val key: ByteArray?, val quality: String, val audioUrl: String? = null, val initRange: LongRange? = null, val indexRange: LongRange? = null, val audioInitRange: LongRange? = null, val audioIndexRange: LongRange? = null)
 class SearchSessionExpiredException: IOException("搜索结果已过期，请从第 1 页重新搜索")
 
 class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).callTimeout(45,TimeUnit.SECONDS).build(), private val clock: () -> Long = System::currentTimeMillis) {
@@ -123,10 +123,10 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         if(episodes.isEmpty() || episodes.any { !it.matches(Regex("[0-9]{1,30}")) } || episodes.distinct().size!=episodes.size) throw IOException("分集数据异常")
         return Detail(card(o).copy(id=id),episodes)
     }
-    fun stream(id: String, maxQuality: Int = 1080): StreamInfo {
+    fun stream(id: String, maxQuality: Int = 1080, seriesId: String = ""): StreamInfo {
         require(id.matches(Regex("[0-9]{1,30}")))
-        // 官网播放页为每集提供公开 mp4（当前仅 360p）：明文、支持 Range、无需签名与解密。
-        // 应用端签名协议（multi_video_model）已被服务端下线（code 110001），公开地址是当前唯一可用通道。
+        // 官网播放页为每集提供公开 mp4（仅 360p）：明文、支持 Range、无需签名与解密，
+        // 因此优先尝试，命中即返回。
         val publicUrl="$site/video/public/$id/360p.mp4"
         val probe=Request.Builder().url(publicUrl).header("User-Agent",VendorConstants.VIDEO_UA).header("Range","bytes=0-15").build()
         val public=runCatching {
@@ -137,7 +137,67 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             }
         }.getOrNull()
         if(public != null) return public
-        // 旧签名链路保留作兜底：若公开地址缺失（下架/风控）且签名接口恢复，仍可解析。
+        // 旧签名链路：公开地址缺失（下架/风控）时，若签名接口恢复仍可解析出明文流。
+        // 注意 DASH 分支（playInfo）当前不启用：那条 720p 流的样本是 CENC 加密的，
+        // play-info 只返回 player_access_key，真正的 AES 内容密钥由站点播放器的
+        // aw.wasm 在 Worker 内派生（见 MediaCrypto 注释），纯 HTTP 侧拿不到，
+        // 贸然打开只会让首帧黑屏。
+        val signedInfo=runCatching { signedStream(id,maxQuality) }.getOrNull()
+        if(signedInfo != null) return signedInfo
+        throw IOException("播放接口暂不可用")
+    }
+    /**
+     * 网页播放器同款接口：按清晰度取 DASH 视频/音频分离流。
+     *
+     * 返回的视频/音频分片是 CENC（AES-CTR）加密的，`play-info` 里的 `player_access_key`
+     * 只是取密钥信封的凭证，不是内容密钥本身。内容密钥需由站点播放器的 `aw.wasm`
+     * 在 Web Worker 内二次解封，目前客户端无法复现，因此本方法只用于探测；
+     * 一旦能拿到明文内容密钥，把 key 填进 [StreamInfo] 即可让 [RemoteVideo] 走 CENC 解密。
+     */
+    internal fun playInfo(vid: String, seriesId: String, maxQuality: Int): StreamInfo {
+        require(seriesId.matches(Regex("[0-9]{1,30}"))) { "缺少剧集标识" }
+        val wanted=listOf(2160,1440,1080,720,540,480,360).firstOrNull { it<=maxQuality } ?: 360
+        val ladder=(listOf(wanted)+listOf(2160,1440,1080,720,540,480,360).filter { it!=wanted && it>wanted }).distinct()
+        for(height in ladder) {
+            val definition="${height}p"
+            val body="""{"series_id":"$seriesId","item_id":"$vid","definition":"$definition"}""".toByteArray()
+            val request=Request.Builder().url("$site/api/video/protected/play-info?aid=8662")
+                .header("User-Agent",VendorConstants.VIDEO_UA).header("Content-Type","application/json; charset=UTF-8")
+                .header("Accept","application/json").header("Referer","$site/player/$seriesId")
+                .post(body.toRequestBody("application/json; charset=UTF-8".toMediaType())).build()
+            val payload=runCatching {
+                RequestScope.execute(http.newCall(request)) { response ->
+                    if(!response.isSuccessful) throw IOException("HTTP ${response.code}")
+                    val text=response.body?.string() ?: throw IOException("播放信息为空")
+                    if(text.length>512*1024) throw IOException("播放信息过大")
+                    text
+                }
+            }.getOrNull() ?: continue
+            val root=runCatching { JSONObject(payload) }.getOrNull() ?: continue
+            if(root.optJSONObject("base_resp")?.optInt("StatusCode",0)!=0) continue
+            val info=root.optJSONObject("play_info") ?: continue
+            val video=cleanUrl(info.str("main_url"))
+            if(!video.startsWith("https://") && !video.startsWith("http://")) continue
+            // 只有 dash 分离流才需要额外音频轨；整段 mp4 自带音轨。
+            val separate=info.str("format").equals("dash",ignoreCase=true)
+            val audioInfo=info.optJSONObject("audio")
+            val audio=if(separate) cleanUrl(audioInfo?.str("main_url").orEmpty()) else ""
+            val label=info.str("definition").ifEmpty { definition }.uppercase()
+            if(separate && !audio.startsWith("https://") && !audio.startsWith("http://")) continue
+            // DASH 分片的 moov 只存在于 init 段，sidx 只存在于 index 段；音视频各有各的区间。
+            val initRange=if(separate) parseRange(info.str("init_range")) else null
+            val indexRange=if(separate) parseRange(info.str("index_range")) else null
+            val audioInitRange=if(separate) parseRange(audioInfo?.str("init_range").orEmpty()) else null
+            val audioIndexRange=if(separate) parseRange(audioInfo?.str("index_range").orEmpty()) else null
+            return StreamInfo(video,null,label,audio.takeIf { it.isNotEmpty() },initRange,indexRange,audioInitRange,audioIndexRange)
+        }
+        throw IOException("播放信息暂不可用")
+    }
+    /**
+     * v1.0 时代的签名链路（`multi_video_model` + `spade_a`）。服务端已下线
+     * （固定返回 code 110001），保留代码只为公开地址缺失时仍能自动恢复。
+     */
+    private fun signedStream(id: String, maxQuality: Int): StreamInfo {
         val payload="""{"biz_param":{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024},"mixed_video_id_map":{"1004":["$id"]}}""".toByteArray()
         val signed=signer.sign("https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/",VendorConstants.device,payload)
         val data=JSONObject(text(signed.url,signed))
@@ -164,6 +224,12 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         return StreamInfo(url,key,quality)
     }
     companion object {
+        /** "0-1234" -> 0L..1234L ；格式异常返回 null。 */
+        fun parseRange(value: String): LongRange? {
+            val m=Regex("(\\d{1,12})-(\\d{1,12})").matchEntire(value.trim()) ?: return null
+            val a=m.groupValues[1].toLong(); val b=m.groupValues[2].toLong()
+            return if(b>=a) a..b else null
+        }
         fun extractRouter(html: String): JSONObject {
             val marker=html.indexOf("_ROUTER_DATA"); if(marker<0) throw IOException("页面没有内容数据")
             val first=html.indexOf('{',marker); if(first<0) throw IOException("页面数据格式错误")

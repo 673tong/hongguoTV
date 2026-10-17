@@ -9,6 +9,10 @@ import java.io.IOException
 
 /** One playback stream. No listening socket or local HTTP service. */
 class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo): Closeable {
+    /** DASH 分离流时可选的独立音频轨；null 表示音视频在同一文件内。 */
+    val audio: RemoteVideo? = info.audioUrl?.takeIf { it.isNotBlank() }?.let {
+        RemoteVideo(http,StreamInfo(it,null,info.quality,initRange=info.audioInitRange ?: info.initRange,indexRange=info.audioIndexRange ?: info.indexRange))
+    }
     @Volatile private var closed=false
     private val calls=mutableSetOf<Call>()
     data class Range(val bytes: ByteArray,val total: Long)
@@ -49,10 +53,31 @@ class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo): Closeab
     }
     @Synchronized fun prepare(): RemoteVideo {
         if(::prepared.isInitialized) return this
+        val declared=info.initRange
+        if(declared != null) { // DASH 分片：init 段自带 ftyp+moov，sidx 在紧随其后的索引段里
+            // 一次性把 init + index 两段取回来拼成"伪头部"：偏移与真实文件一致，
+            // 因此样本索引里的绝对偏移可以直接用于后续分段读取。
+            val index=info.indexRange
+            val wanted=index?.last ?: declared.last
+            // init+index 通常只有 1~2KB，留足 512KB 余量但仍要保证覆盖声明区间。
+            if(wanted>=512*1024L) throw IOException("视频分片索引过大")
+            val head=range(0,wanted)
+            total=head.total
+            prefix=head.bytes
+            if(prefix.size<8 || String(prefix,4,4,Charsets.US_ASCII)!="ftyp") throw IOException("视频容器格式异常")
+            // moov 必须完整落在已取回的头部里，否则样本表会被截断。
+            if(prefix.size.toLong()<=declared.last) throw IOException("视频索引不完整")
+            if(index != null && prefix.size.toLong()<=index.last) throw IOException("视频分片索引不完整")
+            // 无内容密钥时 MediaCrypto 返回空样本表，读取层原样透传（明文分片）。
+            prepared=MediaCrypto.prepare(prefix,info.key)
+            if(prepared.samples.any { it.end>total }) throw IOException("视频样本超出资源大小")
+            return this
+        }
         val first=range(0,256*1024-1); total=first.total
         prefix=first.bytes
         val end=MediaCrypto.headerEnd(first.bytes,total)
         val header=if(end>first.bytes.size) first.bytes+range(first.bytes.size.toLong(),end-1L).bytes else first.bytes.copyOf(end)
+        // 明文 DASH/MP4 无内容密钥，prepare 会返回空样本表，decrypt 原样透传。
         prepared=MediaCrypto.prepare(header,info.key)
         if(prepared.samples.any { it.end>total }) throw IOException("视频样本超出资源大小")
         return this

@@ -848,7 +848,9 @@ class MainActivity: Activity() {
         controls.removeAllViews(); controls.visibility=View.GONE; transportPlay=null; sleepButton=null
         syncMediaSession()
         val requestedId=data.episodes[episodeIndex]; val maxQuality=library.maxQuality; val ticket=generation
-        work({ prefetched ?: RemoteVideo(repository.http,repository.stream(requestedId,maxQuality)).prepare() }, { remote ->
+        // seriesId 只在 playInfo（DASH）分支用到；公开 360p 命中时会被忽略。
+        val requestedSeries=data.series.id
+        work({ prefetched ?: RemoteVideo(repository.http,repository.stream(requestedId,maxQuality,requestedSeries)).prepare() }, { remote ->
             video=remote; quality=remote.info.quality
             val p=player ?: run {
                 val load=DefaultLoadControl.Builder().setBufferDurationsMs(15000,30000,1000,2000).setTargetBufferBytes(12*1024*1024).build()
@@ -893,9 +895,20 @@ class MainActivity: Activity() {
                 override fun onPlayerError(error: PlaybackException) { if(active()) playerFailure(error) }
             }
             playerListener=listener; p.addListener(listener)
-            val source=ProgressiveMediaSource.Factory { VideoDataSource(remote) }.createMediaSource(MediaItem.Builder().setMediaId(requestedId).setUri("hongguotv://episode/$requestedId").setMimeType(MimeTypes.VIDEO_MP4).build())
+            val source=buildMediaSource(remote,requestedId)
             p.setMediaSource(source); p.seekTo(position.coerceAtLeast(0)); p.prepare(); p.playWhenReady=foreground && requestedAutoplay && !pausedForLifecycle && episodePanel==null
         }, { problem -> playerFailure(problem) })
+    }
+    /** DASH 分离流需要把视频轨与音频轨合并；整段 mp4 直接作为单一 progressive 源。 */
+    private fun buildMediaSource(remote: RemoteVideo,id: String): androidx.media3.exoplayer.source.MediaSource {
+        val audio=remote.audio
+        if(audio==null) return ProgressiveMediaSource.Factory { VideoDataSource(remote) }
+            .createMediaSource(MediaItem.Builder().setMediaId(id).setUri("hongguotv://episode/$id").setMimeType(MimeTypes.VIDEO_MP4).build())
+        val videoSource=ProgressiveMediaSource.Factory { VideoDataSource(remote) }
+            .createMediaSource(MediaItem.Builder().setMediaId(id).setUri("hongguotv://episode/$id/video").setMimeType(MimeTypes.VIDEO_MP4).build())
+        val audioSource=ProgressiveMediaSource.Factory { VideoDataSource(audio) }
+            .createMediaSource(MediaItem.Builder().setMediaId(id).setUri("hongguotv://episode/$id/audio").setMimeType(MimeTypes.AUDIO_MP4).build())
+        return androidx.media3.exoplayer.source.MergingMediaSource(videoSource,audioSource)
     }
     private fun closeTransport(http: okhttp3.OkHttpClient?) {
         if(http==null) return
@@ -925,7 +938,7 @@ class MainActivity: Activity() {
             var remote: RemoteVideo?=null
             try {
                 val prepared=scope.run {
-                    RemoteVideo(http,source.stream(id,quality)).also { remote=it; it.warm() }
+                    RemoteVideo(http,source.stream(id,quality,data.series.id)).also { remote=it; it.warm() }
                 }
                 if(preparedNext.complete(ticket,key,prepared)) android.util.Log.i("HongguoTV","Next episode prepared near end")
             } catch(_: Exception) { remote?.close() }
