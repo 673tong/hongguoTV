@@ -16,6 +16,7 @@ import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.core.content.FileProvider
 import com.hongguotv.core.AppUpdate
 import com.hongguotv.core.AppUpdateRepository
@@ -47,6 +48,8 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
     private var retryAfter = 0L
     private var promptedCode = ""
     private var startupChecked = false
+    /** 已装版本与本机签名不一致：只能卸载后重装，覆盖安装必被系统拒绝。 */
+    private var signingConflict = false
     private val auto get() = preferences.getBoolean("automatic", true)
     private val poll = object : Runnable {
         override fun run() {
@@ -140,6 +143,7 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
                 main.post { if (active && generation == ticket) {
                     busy = false; ready = false; retryAfter = System.currentTimeMillis()+30*60*1000L
                     updateStatus(if (e is IOException) e.message ?: "更新失败，请重试" else "更新校验失败，请重试"); renderActions()
+                    if (signingConflict && dialog == null) resolveSigningConflict()
                 } }
             }
         }
@@ -179,13 +183,43 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
         val flags = if (Build.VERSION.SDK_INT >= 28) PackageManager.GET_SIGNING_CERTIFICATES else PackageManager.GET_SIGNATURES
         val candidate = pm.getPackageArchiveInfo(apk.path, flags) ?: throw IOException("安装包无法识别")
         val installed = pm.getPackageInfo(activity.packageName, flags)
-        val version = if (Build.VERSION.SDK_INT >= 28) candidate.longVersionCode else candidate.versionCode.toLong()
         fun signers(info: android.content.pm.PackageInfo) =
             (if (Build.VERSION.SDK_INT >= 28) info.signingInfo?.apkContentsSigners else info.signatures)?.map { it.toCharsString() }?.toSet().orEmpty()
         if (candidate.packageName != activity.packageName || candidate.versionName != update.versionName ||
-            AppUpdate.compareSemver(update.versionName, BuildConfig.VERSION_NAME) <= 0 || candidate.applicationInfo?.minSdkVersion != update.minSdk ||
-            signers(installed).isEmpty() || signers(installed) != signers(candidate))
-            throw IOException("新版包名、版本或签名不匹配，已阻止安装")
+            AppUpdate.compareSemver(update.versionName, BuildConfig.VERSION_NAME) <= 0 || candidate.applicationInfo?.minSdkVersion != update.minSdk)
+            throw IOException("新版包名、版本或最低系统不匹配，已阻止安装")
+        if (signers(installed).isEmpty() || signers(installed) != signers(candidate)) {
+            // 签名与已装版本不同：系统必然拒绝覆盖安装，只能卸载旧版后重装。
+            signingConflict = true
+            throw IOException("新版与本机已装版本签名不同，系统无法覆盖安装。需先卸载旧版（收藏与观看记录会清空）再安装。")
+        }
+        signingConflict = false
+    }
+    /** Offer the one workable path when the signing key changed: uninstall, then install. */
+    private fun resolveSigningConflict() {
+        val update = available ?: return
+        val dp = activity.resources.displayMetrics.density
+        val body = TextView(activity).apply {
+            text = "本机安装的是旧签名版本，无法直接覆盖升级。\n\n" +
+                "选择「卸载并安装」会先卸载当前应用（收藏、观看记录与设置将被清除），随后打开系统安装器安装 ${update.versionName}。\n" +
+                "选择「保留数据」可继续使用当前版本，之后可在系统设置中手动卸载再安装。"
+            textSize = 16f; setTextColor(TvStyle.text); setPadding((24*dp).toInt(), (12*dp).toInt(), (24*dp).toInt(), 0)
+        }
+        val next = AlertDialog.Builder(activity).setTitle("需要先卸载旧版本").setView(body)
+            .setNegativeButton("保留数据", null)
+            .setPositiveButton("卸载并安装", null).create()
+        val restore = anchor
+        next.setOnDismissListener { if (restore?.isAttachedToWindow == true) restore.requestFocus() }
+        next.show()
+        next.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+            next.dismiss()
+            val intent = Intent(Intent.ACTION_DELETE, Uri.parse("package:${activity.packageName}"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            try { activity.startActivity(intent) } catch (_: Exception) {
+                try { activity.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${activity.packageName}"))) }
+                catch (_: Exception) { Toast.makeText(activity, "无法打开系统卸载页，请在电视设置中手动卸载", Toast.LENGTH_LONG).show() }
+            }
+        }
     }
     private fun install() {
         val update = available ?: return
