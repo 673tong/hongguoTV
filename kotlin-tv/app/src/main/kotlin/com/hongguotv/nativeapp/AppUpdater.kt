@@ -45,7 +45,8 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
     private var anchor: View? = null
     private var status = "当前版本 ${BuildConfig.VERSION_NAME}"
     private var retryAfter = 0L
-    private var promptedCode = 0L
+    private var promptedCode = ""
+    private var startupChecked = false
     private val auto get() = preferences.getBoolean("automatic", true)
     private val poll = object : Runnable {
         override fun run() {
@@ -55,7 +56,7 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
                 val last = preferences.getLong("last_attempt", 0)
                 val update = available
                 when {
-                    ready && update != null && promptedCode != update.versionCode && !deferred(update) -> { promptedCode = update.versionCode; show(activity.currentFocus) }
+                    ready && update != null && promptedCode != update.versionName && !deferred(update) -> { promptedCode = update.versionName; show(activity.currentFocus) }
                     update != null && !ready && now >= retryAfter -> download(false)
                     now < last || now - last >= 6 * 60 * 60 * 1000L -> check(false)
                 }
@@ -65,6 +66,8 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
     }
     fun resume() {
         active = true; main.removeCallbacks(poll); main.postDelayed(poll, 8000)
+        // 每次冷启动都强制检查一次新版本（首次 resume 时清空节流时间戳）。
+        if (!startupChecked) { startupChecked = true; preferences.edit().putLong("last_attempt", 0).apply() }
         if (permissionRequested) {
             permissionRequested = false
             if (activity.packageManager.canRequestPackageInstalls()) install()
@@ -84,7 +87,7 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
         Thread({ repository.close() }, "hongguotv-update-cleanup").start()
     }
     private fun updateStatus(text: String) { status = text; statusView?.text = text }
-    private fun deferred(update: AppUpdate) = preferences.getLong("deferred_code", 0) == update.versionCode && preferences.getLong("deferred_until", 0) > System.currentTimeMillis()
+    private fun deferred(update: AppUpdate) = preferences.getString("deferred_version", null) == update.versionName && preferences.getLong("deferred_until", 0) > System.currentTimeMillis()
     private fun renderActions() {
         dialog?.getButton(AlertDialog.BUTTON_POSITIVE)?.apply {
             text = when { busy -> "处理中…"; ready -> "安装新版"; available != null -> "下载新版"; else -> "检查更新" }
@@ -121,7 +124,7 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
         next.show()
         next.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener { when { ready -> install(); available != null -> download(true); else -> check(true) } }
         next.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
-            available?.let { preferences.edit().putLong("deferred_code", it.versionCode).putLong("deferred_until", System.currentTimeMillis()+24*60*60*1000L).apply() }
+            available?.let { preferences.edit().putString("deferred_version", it.versionName).putLong("deferred_until", System.currentTimeMillis()+24*60*60*1000L).apply() }
             next.dismiss()
         }
         renderActions()
@@ -146,9 +149,9 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
         preferences.edit().putLong("last_attempt", System.currentTimeMillis()).apply()
         updateStatus("正在检查新版…")
         work({ repository.latest() }) { update ->
-            available = update.takeIf { it.newerThan(BuildConfig.VERSION_CODE.toLong(), Build.VERSION.SDK_INT) }; ready = false
+            available = update.takeIf { it.newerThan(BuildConfig.VERSION_CODE.toLong(), Build.VERSION.SDK_INT, BuildConfig.VERSION_NAME) }; ready = false
             if (available == null) {
-                updateStatus(if (update.versionCode > BuildConfig.VERSION_CODE && update.minSdk > Build.VERSION.SDK_INT) "新版需要 Android API ${update.minSdk}，当前电视继续使用本版" else "已是最新版本 ${BuildConfig.VERSION_NAME}")
+                updateStatus("已是最新版本 ${BuildConfig.VERSION_NAME}")
                 worker.execute { apk.delete() }
             } else {
                 updateStatus("发现 ${update.versionName} · ${"%.1f".format(update.size/1048576.0)} MB\n${update.notes}")
@@ -166,7 +169,7 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
             validateApk(update)
         }) {
             ready = true; updateStatus("${update.versionName} 已下载并校验\n${update.notes}\n\n确认后由系统覆盖安装，保留本机记录。")
-            if (idle() && dialog == null && (manual || !deferred(update))) { promptedCode = update.versionCode; show(activity.currentFocus) }
+            if (idle() && dialog == null && (manual || !deferred(update))) { promptedCode = update.versionName; show(activity.currentFocus) }
         }
     }
     @Suppress("DEPRECATION")
@@ -179,8 +182,9 @@ class AppUpdater(private val activity: Activity, private val idle: () -> Boolean
         val version = if (Build.VERSION.SDK_INT >= 28) candidate.longVersionCode else candidate.versionCode.toLong()
         fun signers(info: android.content.pm.PackageInfo) =
             (if (Build.VERSION.SDK_INT >= 28) info.signingInfo?.apkContentsSigners else info.signatures)?.map { it.toCharsString() }?.toSet().orEmpty()
-        if (candidate.packageName != activity.packageName || version != update.versionCode || candidate.versionName != update.versionName || version <= BuildConfig.VERSION_CODE ||
-            candidate.applicationInfo?.minSdkVersion != update.minSdk || signers(installed).isEmpty() || signers(installed) != signers(candidate))
+        if (candidate.packageName != activity.packageName || candidate.versionName != update.versionName ||
+            AppUpdate.compareSemver(update.versionName, BuildConfig.VERSION_NAME) <= 0 || candidate.applicationInfo?.minSdkVersion != update.minSdk ||
+            signers(installed).isEmpty() || signers(installed) != signers(candidate))
             throw IOException("新版包名、版本或签名不匹配，已阻止安装")
     }
     private fun install() {

@@ -23,13 +23,25 @@ class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo): Closeab
         synchronized(calls) { if(closed) throw IOException("播放请求已取消"); calls+=call }
         try {
             return RequestScope.execute(call) { response ->
+                val body=response.body ?: throw IOException("视频分段为空")
+                if(response.code==200) { // CDN 忽略 Range 时退化为整段读取并切片（与服务端 hongguo.cjs 行为一致）
+                    val bytes=body.source().readByteArray()
+                    val full=bytes.size.toLong()
+                    if(full<=0) throw IOException("视频分段为空")
+                    if(full>64L*1024*1024) throw IOException("视频服务器不支持分段读取（HTTP 200，资源过大）")
+                    if(total!=0L && full!=total) throw IOException("视频资源已变化，请重试")
+                    total=full
+                    val last=minOf(end,full-1)
+                    val n=(last-start+1).toInt()
+                    return@execute Range(bytes.copyOfRange(start.toInt(),(start+n).toInt().coerceAtMost(bytes.size)),full)
+                }
                 if(response.code!=206) throw IOException("视频服务器不支持分段读取（HTTP ${response.code}）")
                 val match=Regex("bytes (\\d+)-(\\d+)/(\\d+)").matchEntire(response.header("Content-Range").orEmpty()) ?: throw IOException("视频分段响应异常")
                 val (begin,finish,size)=match.destructured
                 val full=size.toLong(); val last=minOf(end,full-1)
                 if(begin.toLong()!=start || finish.toLong()!=last || full<=0) throw IOException("视频分段范围不匹配")
                 if(total!=0L && full!=total) throw IOException("视频资源已变化，请重试")
-                val n=(last-start+1).toInt(); val body=response.body ?: throw IOException("视频分段为空")
+                val n=(last-start+1).toInt()
                 val bytes=body.source().readByteArray(n.toLong())
                 Range(bytes,full)
             }
