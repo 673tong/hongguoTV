@@ -125,6 +125,19 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
     }
     fun stream(id: String, maxQuality: Int = 1080): StreamInfo {
         require(id.matches(Regex("[0-9]{1,30}")))
+        // 官网播放页为每集提供公开 mp4（当前仅 360p）：明文、支持 Range、无需签名与解密。
+        // 应用端签名协议（multi_video_model）已被服务端下线（code 110001），公开地址是当前唯一可用通道。
+        val publicUrl="$site/video/public/$id/360p.mp4"
+        val probe=Request.Builder().url(publicUrl).header("User-Agent",VendorConstants.VIDEO_UA).header("Range","bytes=0-15").build()
+        val public=runCatching {
+            RequestScope.execute(http.newCall(probe)) { response ->
+                // 必须是 206：证明 CDN 真支持 Range；200 会被当作不可分段而退回签名链路。
+                if(response.code!=206) throw IOException("HTTP ${response.code}")
+                StreamInfo(publicUrl,null,"360P（网页版）")
+            }
+        }.getOrNull()
+        if(public != null) return public
+        // 旧签名链路保留作兜底：若公开地址缺失（下架/风控）且签名接口恢复，仍可解析。
         val payload="""{"biz_param":{"detail_page_version":0,"device_level":3,"disable_digg_stat":false,"need_all_video_definition":true,"need_mp4_align":false,"use_os_player":false,"use_server_dns":false,"video_platform":1024},"mixed_video_id_map":{"1004":["$id"]}}""".toByteArray()
         val signed=signer.sign("https://api5-normal-sinfonlineb.fqnovel.com/novel/player/multi_video_model/v1/",VendorConstants.device,payload)
         val data=JSONObject(text(signed.url,signed))

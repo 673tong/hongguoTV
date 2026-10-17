@@ -675,6 +675,15 @@ function decryptPartial(data, start, key, prepared) {
 
 async function resolveStream(vid, quality) {
     const cacheKey = playKey(vid, quality); const cached = streamCache.get(cacheKey); if (cached && Date.now() - cached.time < 300000) return cached.value;
+    // 官网播放页提供公开明文 mp4（当前仅 360p），优先使用；应用签名接口已返回 110001。
+    const publicUrl = `https://hongguoduanju.com/video/public/${str(vid)}/360p.mp4`;
+    try {
+        const probe = await axios.head(publicUrl, { headers: { 'User-Agent': VIDEO_UA }, timeout: 15000 });
+        if (probe.status === 200 && str(probe.headers['content-length']) !== '0') {
+            const result = { url: publicUrl, quality: '360P（网页版）', key: null };
+            streamCache.set(cacheKey, { time: Date.now(), value: result }); return result;
+        }
+    } catch { /* 公开地址不可用时回退签名链路 */ }
     const { info, rows } = await fetchVideoInfo(vid); const wanted = str(quality, 'auto');
     const selected = rows.find((row) => row.key === wanted || qualityNumber(row.quality) === qualityNumber(wanted)) || rows[0]; if (!selected) throw new Error('没有可用清晰度');
     let url = cleanUrl(selected.item.main_url); const seed = Buffer.from(str(info.key_seed), 'base64');
