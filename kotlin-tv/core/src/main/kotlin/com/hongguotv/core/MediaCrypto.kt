@@ -47,6 +47,51 @@ object MediaCrypto {
     }
     fun prepare(data: ByteArray,key: ByteArray?): Prepared {
         if(key==null) return Prepared(data.copyOf(),emptyList())
+        return prepareEncrypted(data)
+    }
+    /**
+     * 把 init 段（ftyp+moov）里的加密轨道描述清理成明文：`encv/enca` 还原为
+     * `frma` 声明的原始编码（avc1/mp4a…），`sinf` 内容清零。
+     *
+     * DASH 分片流（密钥在 wasm）必须走这一步：分片样本由外部解密器处理，
+     * 但 init 段若仍带 `sinf/tenc`，解码器会把它当加密流直接报错
+     * （已用 ffmpeg 验证：不清理则 "Incorrect number of samples in encryption info"）。
+     * 返回清理后的副本；没有加密描述时原样返回。
+     */
+    fun sanitizeHeader(data: ByteArray): ByteArray {
+        val moov=box(data,data.u32(0).toInt()) ?: return data
+        if(moov.type!="moov") return data
+        val header=data.copyOf(); var changed=false
+        var cursor=moov.body
+        while(cursor<moov.end) {
+            val track=box(data,cursor,moov.end) ?: break; cursor=track.end
+            if(track.type!="trak") continue
+            val stbl=find(data,"stbl",track.body,track.end) ?: continue
+            var at=stbl.body
+            while(at+8<=stbl.end) {
+                val sinf=find(data,"sinf",at,stbl.end) ?: break
+                val frma=find(data,"frma",sinf.body,sinf.end) ?: break
+                if(frma.body+4>frma.end) break
+                val original=data.copyOfRange(frma.body,frma.body+4)
+                var entryAt=sinf.start-1
+                while(entryAt>=stbl.body) {
+                    val type=String(data,entryAt,4,Charsets.US_ASCII)
+                    if(type=="encv" || type=="enca") { original.copyInto(header,entryAt); changed=true; break }; entryAt--
+                }
+                "free".toByteArray().copyInto(header,sinf.start+4); header.fill(0,sinf.body,sinf.end)
+                at=sinf.end
+            }
+        }
+        return if(changed) header else data
+    }
+    /**
+     * 解析 CENC 样本表，不需要内容密钥。
+     *
+     * 用于"密钥在别处（aw.wasm）"的场景：调用方只要拿到每个加密子样本的
+     * 绝对偏移和 IV，就能把数据块交给外部解密器。此实现与 [decrypt] 共用
+     * 同一套 senc/saiz/saio 解析逻辑，保证偏移口径一致。
+     */
+    fun prepareEncrypted(data: ByteArray): Prepared {
         val moov=box(data,data.u32(0).toInt()) ?: throw IOException("视频索引不完整")
         require(moov.type=="moov")
         val samples=mutableListOf<Sample>(); val header=data.copyOf()
@@ -130,6 +175,116 @@ object MediaCrypto {
         val sorted=samples.sortedBy { it.start }
         if(sorted.zipWithNext().any { (a,b) -> a.end>b.start }) throw IOException("视频样本重叠")
         return Prepared(header,sorted)
+    }
+    /**
+     * 解析一个 DASH 分片（`moof` + `mdat`）里的加密样本，不需要内容密钥。
+     *
+     * 与 [prepareEncrypted] 的区别：DASH 分片不靠 `stbl/saiz/saio` 索引，
+     * 每个 `traf` 自带 `trun`（样本大小）和 `senc`（每样本 IV + 子样本表），
+     * 样本数据起点由 `trun.data_offset` 相对 `moof` 起点给出。
+     *
+     * @param fragment 从 `moof` 起点开始的字节
+     * @param baseOffset `fragment[0]` 在整条流里的绝对偏移（用于换算成绝对地址）
+     */
+    fun prepareFragment(fragment: ByteArray, baseOffset: Long): List<Sample> {
+        val moof=box(fragment,0) ?: throw IOException("分片索引不完整")
+        if(moof.type!="moof") throw IOException("分片索引格式异常")
+        val result=mutableListOf<Sample>()
+        var cursor=moof.body
+        while(cursor<moof.end) {
+            val traf=box(fragment,cursor,moof.end) ?: break; cursor=traf.end
+            if(traf.type!="traf") continue
+            result+=parseTraf(fragment,traf,baseOffset,moof.start)
+        }
+        if(result.isEmpty()) throw IOException("分片没有可解密样本")
+        return result.sortedBy { it.start }
+    }
+    private fun parseTraf(data: ByteArray, traf: Box, baseOffset: Long, moofStart: Int): List<Sample> {
+        val trun=find(data,"trun",traf.body,traf.end) ?: throw IOException("分片样本表缺失")
+        val senc=find(data,"senc",traf.body,traf.end) ?: throw IOException("分片加密表缺失")
+        // 默认 IV 长度取自 init 段的 tenc；DASH 分片固定 16，先用 16 并在下方按 senc 实际长度校验。
+        val ivSize=16
+        val samples=sencSamples(data,senc,ivSize)
+        val offsets=runOffsets(data,trun,moofStart,baseOffset,samples.size)
+        if(offsets.size!=samples.size) throw IOException("分片样本与加密表数量不一致")
+        val out=mutableListOf<Sample>()
+        for(i in offsets.indices) {
+            val s=offsets[i]; val iv=samples[i].iv; var encrypted=0L; var position=s.start
+            if(samples[i].subsamples.isEmpty()) {
+                out+=Sample(position,position+s.length,iv)
+            } else {
+                for(sub in samples[i].subsamples) {
+                    position+=sub.clear
+                    if(sub.protected>0) out+=Sample(position,position+sub.protected,iv,encrypted)
+                    encrypted+=sub.protected; position+=sub.protected
+                }
+            }
+        }
+        return out
+    }
+    private class EncSample(val iv: ByteArray, val subsamples: List<SubSample>)
+    private class SubSample(val clear: Long, val protected: Long)
+    /** senc：可选的 (type,param) 8 字节前缀 + sample_count + 每样本 IV + 可选子样本表。 */
+    private fun sencSamples(data: ByteArray, senc: Box, ivSize: Int): List<EncSample> {
+        // senc 的头部是 version(1B) + flags(3B)：flags & 0x2 表示每样本后面跟子样本表。
+        // 注意 DASH 分片的 senc 不带 (type,parameter) 8 字节前缀，样本区紧跟 sample_count。
+        val flags=data.i32(senc.body) and 0xffffff
+        val hasSubsamples=(flags and 0x2)!=0
+        var at=senc.body+4
+        if(at+4>senc.end) throw IOException("加密表截断")
+        val count=data.u32(at).toInt(); at+=4
+        if(count<0 || count>200000) throw IOException("加密表数量异常")
+        val list=ArrayList<EncSample>(count)
+        for(i in 0 until count) {
+            if(at+ivSize>senc.end) throw IOException("加密表截断")
+            val iv=data.copyOfRange(at,at+ivSize); at+=ivSize
+            val subs=if(hasSubsamples) {
+                if(at+2>senc.end) throw IOException("加密表截断")
+                val n=((data[at].u() shl 8) or data[at+1].u()); at+=2
+                if(n>1024) throw IOException("子样本数量异常")
+                (0 until n).map {
+                    if(at+6>senc.end) throw IOException("加密表截断")
+                    val clear=((data[at].u() shl 8) or data[at+1].u()).toLong()
+                    val protected=data.u32(at+2); at+=6
+                    SubSample(clear,protected)
+                }
+            } else emptyList()
+            list+=EncSample(iv,subs)
+        }
+        return list
+    }
+    private class Run(val start: Long, val length: Long)
+    /**
+     * trun：按 flags 逐项取 sample_duration / sample_size / sample_flags / composition_offset，
+     * 样本数据从 `moof.start + data_offset` 开始连续排列。
+     */
+    private fun runOffsets(data: ByteArray, trun: Box, moofStart: Int, baseOffset: Long, count: Int): List<Run> {
+        val flags=data.i32(trun.body) and 0xffffff
+        var at=trun.body+4
+        val declared=data.u32(at).toInt(); at+=4
+        if(declared!=count || at+4>trun.end) throw IOException("分片样本数量不一致")
+        val dataOffset=data.i32(at).toLong(); at+=4
+        // 0x4 表示 data_offset 之后紧跟一个 first_sample_flags（整片共用），必须跳过；
+        // 站点分片的 flags=0xa05 正是 "data_offset|first_sample_flags|sample_size|composition_offset"。
+        val hasFirstFlags=(flags and 0x4)!=0
+        if(hasFirstFlags) at+=4
+        val hasDuration=(flags and 0x100)!=0
+        val hasSize=(flags and 0x200)!=0
+        val hasFlags=(flags and 0x400)!=0
+        val hasOffset=(flags and 0x800)!=0
+        if(!hasSize) throw IOException("分片未声明样本大小")
+        var position=baseOffset+moofStart+dataOffset
+        val runs=ArrayList<Run>(count)
+        repeat(count) {
+            if(hasDuration) at+=4
+            if(at+4>trun.end) throw IOException("样本表截断")
+            val size=data.u32(at); at+=4
+            if(hasFlags) at+=4
+            if(hasOffset) at+=4
+            if(size<=0) throw IOException("样本大小异常")
+            runs+=Run(position,size); position+=size
+        }
+        return runs
     }
     fun decrypt(data: ByteArray,start: Long,key: ByteArray?,prepared: Prepared): ByteArray {
         require(start>=0)

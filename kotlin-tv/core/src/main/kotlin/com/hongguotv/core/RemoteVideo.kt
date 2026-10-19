@@ -9,9 +9,28 @@ import java.io.IOException
 
 /** One playback stream. No listening socket or local HTTP service. */
 class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo): Closeable {
+    /**
+     * CENC 解密钩子：`info.key` 为 null 但分片是加密的（720p DASH）时，
+     * 由外层注入一个按 (密文, IV) 解明的实现。
+     *
+     * 为什么不用 `info.key`：那条流的内容密钥封在站点播放器的 aw.wasm 里，
+     * 解封后只存在于 wasm 线性内存，导不出 16 字节密钥，只能把数据交给它算。
+     * 见 app 模块的 CencKeyBridge。
+     */
+    fun interface BlockDecryptor { fun decrypt(data: ByteArray, iv: ByteArray): ByteArray }
+    var decryptor: BlockDecryptor? = null
+    /** 非 0 表示分片流：样本表按 moof 逐片解析，[prepared] 只用来透传 init 段的明文头部。 */
+    private var fragmentLength = 0L
     /** DASH 分离流时可选的独立音频轨；null 表示音视频在同一文件内。 */
     val audio: RemoteVideo? = info.audioUrl?.takeIf { it.isNotBlank() }?.let {
-        RemoteVideo(http,StreamInfo(it,null,info.quality,initRange=info.audioInitRange ?: info.initRange,indexRange=info.audioIndexRange ?: info.indexRange))
+        RemoteVideo(http,StreamInfo(
+            it,null,info.quality,
+            initRange=info.audioInitRange ?: info.initRange,
+            indexRange=info.audioIndexRange ?: info.indexRange,
+            // 音轨同样是 CENC：共享同一个信封凭证（play-info 的 audio 节点通常不再单独给）。
+            accessKey=info.accessKey.takeIf { info.audioEncrypted },
+            audioEncrypted=info.audioEncrypted,
+        ))
     }
     @Volatile private var closed=false
     private val calls=mutableSetOf<Call>()
@@ -68,8 +87,18 @@ class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo): Closeab
             // moov 必须完整落在已取回的头部里，否则样本表会被截断。
             if(prefix.size.toLong()<=declared.last) throw IOException("视频索引不完整")
             if(index != null && prefix.size.toLong()<=index.last) throw IOException("视频分片索引不完整")
-            // 无内容密钥时 MediaCrypto 返回空样本表，读取层原样透传（明文分片）。
-            prepared=MediaCrypto.prepare(prefix,info.key)
+            // 分片流（DASH）：mtail 模式没有全局样本表，样本表按 moof 逐片解析，
+            // 这里只保留 ftyp+moov 作为明文头部（读 0 偏移时透传）。
+            // 有 info.key 的整段加密流仍走 MediaCrypto.prepare 的全局表。
+            prepared=if(info.accessKey!=null && info.key==null) {
+                fragmentLength=(index?.last ?: declared.last)+1L
+                // 分片样本由外部解密器处理；init 段要先把 sinf/tenc 清理成明文轨道，
+                // 否则解码器会把整条流当加密流拒绝（见 MediaCrypto.sanitizeHeader）。
+                val clean=MediaCrypto.sanitizeHeader(prefix)
+                if(clean.size!=prefix.size) throw IOException("视频索引清理异常")
+                prefix=clean
+                MediaCrypto.Prepared(prefix.copyOf(),emptyList())
+            } else MediaCrypto.prepare(prefix,info.key)
             if(prepared.samples.any { it.end>total }) throw IOException("视频样本超出资源大小")
             return this
         }
@@ -97,7 +126,72 @@ class RemoteVideo(private val http: OkHttpClient, val info: StreamInfo): Closeab
         val available=(minOf(end,cached.size.toLong())-start).coerceAtLeast(0).toInt()
         val first=if(available>0) cached.copyOfRange(start.toInt(),start.toInt()+available) else byteArrayOf()
         val raw=if(start+available<end) first+range(start+available,end-1).bytes else first
+        // 外部解密器优先：它对应"密钥在 wasm 里"的 CENC 流，此时 info.key 必为 null。
+        decryptor?.let { return decryptWith(it,raw,start) }
         return MediaCrypto.decrypt(raw,start,info.key,prepared)
+    }
+    /**
+     * 用外部解密器处理一段读取。
+     *
+     * 两条分支：
+     * - 分片流（[fragmentLength] 非空）：每次读先把当前 `moof` 解析成样本表，再按需解密；
+     * - 整段流：用 [MediaCrypto.prepareEncrypted] 建好的全局样本表。
+     *
+     * CTR 是流密码，只要保证"相对样本起点的字节偏移"不变，窗口裁剪不影响结果。
+     */
+    private fun decryptWith(engine: BlockDecryptor, data: ByteArray, start: Long): ByteArray {
+        val result=data.copyOf(); val end=start+data.size
+        val samples=if(fragmentLength>0L) fragmentSamples(start,end) else prepared.samples
+        if(samples.isEmpty()) return result
+        var low=0; var high=samples.size
+        while(low<high) { val middle=(low+high) ushr 1; if(samples[middle].end<=start) low=middle+1 else high=middle }
+        for(i in low until samples.size) {
+            val sample=samples[i]; if(sample.start>=end) break
+            val begin=maxOf(start,sample.start); val stop=minOf(end,sample.end); if(begin>=stop) continue
+            // 落在本样本内的相对偏移（含子样本前缀的明文字节），用于对齐 CTR 计数器。
+            val relative=begin-sample.start+sample.encryptedOffset
+            if(relative%16!=0L) throw IOException("加密样本未按 16 字节对齐")
+            val chunk=result.copyOfRange((begin-start).toInt(),(stop-start).toInt())
+            val iv=sample.iv.copyOf(16)
+            val plain=engine.decrypt(chunk,iv)
+            if(plain.size!=chunk.size) throw IOException("解密块长度不一致")
+            plain.copyInto(result,(begin-start).toInt())
+        }
+        return result
+    }
+    /** 分片模式下按需解析当前 `moof`；只缓存最近一片，避免长片堆积。 */
+    private var cachedSamples: List<MediaCrypto.Sample> = emptyList()
+    private fun fragmentSamples(start: Long, end: Long): List<MediaCrypto.Sample> {
+        cachedSamples.firstOrNull { it.end>start }?.let { if(it.start<end) return cachedSamples }
+        if(cachedSamples.any { it.start<=start && it.end>start }) return cachedSamples
+        // 向前找最近的 moof 起点；分片头的 moof 通常就在 start 之前不到 16KB 处。
+        val probeFrom=maxOf(0L,start-16384)
+        val head=readRaw(probeFrom,minOf(total,start+16384)-probeFrom)
+        var at=-1
+        var cursor=0
+        while(cursor+8<=head.size) {
+            val size=head.u32(cursor).toLong()
+            val type=String(head,cursor+4,4,Charsets.US_ASCII)
+            if(size<8 || cursor+size>head.size) { cursor++; continue }
+            if(type=="moof") { at=cursor; break }
+            cursor+=size.toInt()
+        }
+        if(at<0) return emptyList()
+        // moof 可能跨过探测窗口，按声明大小补足。
+        val moofSize=head.u32(at).toInt()
+        val absolute=probeFrom+at
+        val bytes=if(at+moofSize<=head.size) head.copyOfRange(at,at+moofSize)
+                  else head.copyOfRange(at,head.size)+readRaw(absolute+head.size-at,(moofSize-(head.size-at)).toLong())
+        cachedSamples=MediaCrypto.prepareFragment(bytes,absolute)
+        return cachedSamples
+    }
+    private fun readRaw(start: Long,length: Long): ByteArray {
+        if(length<=0) return byteArrayOf()
+        val capped=minOf(length,8L*1024*1024)
+        val cached=prefix
+        val available=(minOf(start+capped,cached.size.toLong())-start).coerceAtLeast(0).toInt()
+        val first=if(available>0) cached.copyOfRange(start.toInt(),start.toInt()+available) else byteArrayOf()
+        return if(available<capped) first+range(start+available,minOf(total,start+capped)-1).bytes else first
     }
     override fun close() { synchronized(calls) { closed=true; calls.toList().forEach { it.cancel() }; calls.clear() } }
 }

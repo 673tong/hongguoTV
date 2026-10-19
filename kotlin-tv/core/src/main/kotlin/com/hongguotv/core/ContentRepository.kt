@@ -21,7 +21,18 @@ data class Detail(val series: Series, val episodes: List<String>)
 data class RankPosition(val rank: Int?, val heat: String)
 data class ComicRanking(val positions: Map<String,RankPosition>, val totalPages: Int, val updatedText: String)
 data class CatalogPage(val items: List<Series>, val hasMore: Boolean, val ranking: ComicRanking? = null)
-data class StreamInfo(val url: String, val key: ByteArray?, val quality: String, val audioUrl: String? = null, val initRange: LongRange? = null, val indexRange: LongRange? = null, val audioInitRange: LongRange? = null, val audioIndexRange: LongRange? = null)
+data class StreamInfo(
+    val url: String, val key: ByteArray?, val quality: String,
+    val audioUrl: String? = null, val initRange: LongRange? = null, val indexRange: LongRange? = null,
+    val audioInitRange: LongRange? = null, val audioIndexRange: LongRange? = null,
+    /**
+     * 站点播放器的信封凭证。非空时表示分片是 CENC 加密的，
+     * 需交给 aw.wasm 解封后逐块解密（见 app 模块 CencKeyBridge）。
+     */
+    val accessKey: String? = null,
+    /** 音频轨是否同样加密；DASH 音视频通常都加密。 */
+    val audioEncrypted: Boolean = false,
+)
 class SearchSessionExpiredException: IOException("搜索结果已过期，请从第 1 页重新搜索")
 
 class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectTimeout(15,TimeUnit.SECONDS).readTimeout(30,TimeUnit.SECONDS).callTimeout(45,TimeUnit.SECONDS).build(), private val clock: () -> Long = System::currentTimeMillis) {
@@ -123,10 +134,20 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
         if(episodes.isEmpty() || episodes.any { !it.matches(Regex("[0-9]{1,30}")) } || episodes.distinct().size!=episodes.size) throw IOException("分集数据异常")
         return Detail(card(o).copy(id=id),episodes)
     }
+    /**
+     * 解析一集的播放地址。
+     *
+     * 顺序：用户要求高于 360p 且知道 seriesId 时先走 DASH 高清（CENC，需 wasm 解密）；
+     * 否则用公开 360p（明文、免解密）；两者都不行再退回旧签名链路。
+     */
     fun stream(id: String, maxQuality: Int = 1080, seriesId: String = ""): StreamInfo {
         require(id.matches(Regex("[0-9]{1,30}")))
-        // 官网播放页为每集提供公开 mp4（仅 360p）：明文、支持 Range、无需签名与解密，
-        // 因此优先尝试，命中即返回。
+        // 想要 720p 以上：DASH 是唯一来源，先试它。
+        if(seriesId.isNotEmpty() && maxQuality>360) {
+            val hd=runCatching { playInfo(id,seriesId,maxQuality) }.getOrNull()
+            if(hd != null) return hd
+        }
+        // 官网播放页为每集提供公开 mp4（仅 360p）：明文、支持 Range、无需签名与解密，命中即返回。
         val publicUrl="$site/video/public/$id/360p.mp4"
         val probe=Request.Builder().url(publicUrl).header("User-Agent",VendorConstants.VIDEO_UA).header("Range","bytes=0-15").build()
         val public=runCatching {
@@ -137,11 +158,12 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             }
         }.getOrNull()
         if(public != null) return public
-        // 旧签名链路：公开地址缺失（下架/风控）时，若签名接口恢复仍可解析出明文流。
-        // 注意 DASH 分支（playInfo）当前不启用：那条 720p 流的样本是 CENC 加密的，
-        // play-info 只返回 player_access_key，真正的 AES 内容密钥由站点播放器的
-        // aw.wasm 在 Worker 内派生（见 MediaCrypto 注释），纯 HTTP 侧拿不到，
-        // 贸然打开只会让首帧黑屏。
+        // 用户只要 360p、或高清晰度没拿到：再看一次 DASH（可能只有低清档位）。
+        if(seriesId.isNotEmpty() && maxQuality<=360) {
+            val hd=runCatching { playInfo(id,seriesId,maxQuality) }.getOrNull()
+            if(hd != null) return hd
+        }
+        // 旧签名链路：两条新链路都失败时，若签名接口恢复仍可解析出明文流。
         val signedInfo=runCatching { signedStream(id,maxQuality) }.getOrNull()
         if(signedInfo != null) return signedInfo
         throw IOException("播放接口暂不可用")
@@ -189,7 +211,16 @@ class ContentRepository(val http: OkHttpClient = OkHttpClient.Builder().connectT
             val indexRange=if(separate) parseRange(info.str("index_range")) else null
             val audioInitRange=if(separate) parseRange(audioInfo?.str("init_range").orEmpty()) else null
             val audioIndexRange=if(separate) parseRange(audioInfo?.str("index_range").orEmpty()) else null
-            return StreamInfo(video,null,label,audio.takeIf { it.isNotEmpty() },initRange,indexRange,audioInitRange,audioIndexRange)
+            // player_access_key 是信封凭证，不是内容密钥：客户端要通过 aw.wasm 解封后才可解密，
+            // 所以这里只把凭证带走，key 保持 null，由播放层决定是否启用。
+            val accessKey=info.str("player_access_key").takeIf { it.isNotEmpty() }
+            val audioKey=audioInfo?.str("player_access_key").orEmpty().ifEmpty { accessKey.orEmpty() }
+            return StreamInfo(
+                video, null, label, audio.takeIf { it.isNotEmpty() },
+                initRange, indexRange, audioInitRange, audioIndexRange,
+                accessKey,
+                audioEncrypted = separate && audioKey.isNotEmpty(),
+            )
         }
         throw IOException("播放信息暂不可用")
     }

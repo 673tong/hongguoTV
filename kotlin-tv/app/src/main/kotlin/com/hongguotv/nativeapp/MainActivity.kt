@@ -143,6 +143,13 @@ class MainActivity: Activity() {
     private var synopsisExpanded=false
     private var player: ExoPlayer?=null
     private var video: RemoteVideo?=null
+    /**
+     * CENC 流的解密器。720p DASH 分片的内容密钥封在站点播放器的 aw.wasm 里，
+     * 只能由 WebView 运行该 wasm 解封，见 CencKeyBridge。
+     * 懒创建：只有真正遇到加密流才起 WebView。
+     */
+    private var keyBridge: CencKeyBridge?=null
+    private fun bridgeFor(): CencKeyBridge = keyBridge ?: CencKeyBridge(this).also { keyBridge=it }
     private var playbackReady=false
     private var pausedForLifecycle=false
     private lateinit var hud: LinearLayout
@@ -850,7 +857,7 @@ class MainActivity: Activity() {
         val requestedId=data.episodes[episodeIndex]; val maxQuality=library.maxQuality; val ticket=generation
         // seriesId 只在 playInfo（DASH）分支用到；公开 360p 命中时会被忽略。
         val requestedSeries=data.series.id
-        work({ prefetched ?: RemoteVideo(repository.http,repository.stream(requestedId,maxQuality,requestedSeries)).prepare() }, { remote ->
+        work({ prefetched ?: openVideo(repository.http,repository.stream(requestedId,maxQuality,requestedSeries)) }, { remote ->
             video=remote; quality=remote.info.quality
             val p=player ?: run {
                 val load=DefaultLoadControl.Builder().setBufferDurationsMs(15000,30000,1000,2000).setTargetBufferBytes(12*1024*1024).build()
@@ -899,9 +906,26 @@ class MainActivity: Activity() {
             p.setMediaSource(source); p.seekTo(position.coerceAtLeast(0)); p.prepare(); p.playWhenReady=foreground && requestedAutoplay && !pausedForLifecycle && episodePanel==null
         }, { problem -> playerFailure(problem) })
     }
+    /**
+     * 创建并预热一个 [RemoteVideo]。
+     *
+     * 加密流（`info.accessKey` 非空）要先让 wasm 解封凭证，再把解密器挂到视频轨和音频轨上；
+     * 这一步必须在 [prepare] 之前完成，否则分片会按密文送进解码器。
+     */
+    private fun openVideo(http: okhttp3.OkHttpClient, info: com.hongguotv.core.StreamInfo): RemoteVideo {
+        val remote=RemoteVideo(http,info)
+        val accessKey=info.accessKey
+        if(accessKey!=null) {
+            val bridge=bridgeFor()
+            bridge.prepare(accessKey)
+            val engine=RemoteVideo.BlockDecryptor { data,iv -> bridge.decrypt(data,iv) }
+            remote.decryptor=engine
+            remote.audio?.decryptor=engine
+        }
+        return remote.prepare()
+    }
     /** DASH 分离流需要把视频轨与音频轨合并；整段 mp4 直接作为单一 progressive 源。 */
-    private fun buildMediaSource(remote: RemoteVideo,id: String): androidx.media3.exoplayer.source.MediaSource {
-        val audio=remote.audio
+    private fun buildMediaSource(remote: RemoteVideo,id: String): androidx.media3.exoplayer.source.MediaSource {        val audio=remote.audio
         if(audio==null) return ProgressiveMediaSource.Factory { VideoDataSource(remote) }
             .createMediaSource(MediaItem.Builder().setMediaId(id).setUri("hongguotv://episode/$id").setMimeType(MimeTypes.VIDEO_MP4).build())
         val videoSource=ProgressiveMediaSource.Factory { VideoDataSource(remote) }
@@ -938,7 +962,7 @@ class MainActivity: Activity() {
             var remote: RemoteVideo?=null
             try {
                 val prepared=scope.run {
-                    RemoteVideo(http,source.stream(id,quality,data.series.id)).also { remote=it; it.warm() }
+                    openVideo(http,source.stream(id,quality,data.series.id)).also { remote=it }.let { it.warm() }
                 }
                 if(preparedNext.complete(ticket,key,prepared)) android.util.Log.i("HongguoTV","Next episode prepared near end")
             } catch(_: Exception) { remote?.close() }

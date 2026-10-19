@@ -255,7 +255,7 @@ class ContentRepositoryTest {
         }.build()
     )
 
-    @Test fun publicMp4WinsWithoutProbingPlayInfo() {
+    @Test fun publicMp4WinsWhenOnlyStandardQualityIsWanted() {
         val paths=mutableListOf<String>()
         val repo=playbackRepository { request ->
             paths+=request.url.encodedPath
@@ -264,7 +264,7 @@ class ContentRepositoryTest {
                 else -> 200 to """{"base_resp":{"StatusCode":0},"play_info":{"main_url":"https://cdn.example.com/v.mp4","definition":"720p","format":"dash"}}"""
             }
         }
-        val result=repo.stream("123",1080,"999")
+        val result=repo.stream("123",360,"999")
         assertEquals("https://hongguoduanju.com/video/public/123/360p.mp4",result.url)
         assertEquals("360P（网页版）",result.quality)
         assertNull(result.key); assertNull(result.audioUrl)
