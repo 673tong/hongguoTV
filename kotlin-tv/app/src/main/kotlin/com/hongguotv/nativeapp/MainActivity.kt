@@ -164,6 +164,9 @@ class MainActivity: Activity() {
     private var playError=false
     private var lastSaved=0L
     private var quality=""
+    /** 扫码登录的会话。Cookie 只在本机私有存储，不参与备份。 */
+    private val accountStore by lazy { AccountStore(this) }
+    private val accountSession by lazy { AccountSession(repository.http,accountStore) }
     private val tick=object: Runnable {
         override fun run() {
             if(!foreground || isDestroyed) return
@@ -690,6 +693,8 @@ class MainActivity: Activity() {
             library.autoNext=!library.autoNext
             autoNextButton.text="自动连播  ·  ${if(library.autoNext) "开启" else "关闭"}"
         }
+        lateinit var account: TextView
+        account=setting(device,accountLabel()) { showAccount(account) }
         lateinit var backup: TextView
         backup=setting(device,"手机备份与恢复") {
             runCatching { LibraryBackup.encode(library.snapshot()) }.onSuccess { encoded ->
@@ -710,13 +715,14 @@ class MainActivity: Activity() {
         val license=setting(device,"开源许可") {
             AlertDialog.Builder(this).setTitle("开源许可").setMessage("本原生版以 GPL-3.0 发布。\n内容协议与加密处理移植自 drpys（22261ad）。\nAndroidX Media3 / OkHttp：Apache-2.0\nKotlin：Apache-2.0\nBouncy Castle：MIT\n完整源码和许可证见 GitHub：N3urda/hongguoTV-updates。").setPositiveButton("关闭",null).show()
         }
-        val left=listOf(qualityButton,defaultSpeed,frame,autoNextButton); val right=listOf(backup,hidden,updates,license)
+        val left=listOf(qualityButton,defaultSpeed,frame,autoNextButton); val right=listOf(account,backup,hidden,updates,license)
         listOf(left,right).forEach { items -> items.forEachIndexed { index,view ->
             view.nextFocusUpId=items.getOrNull(index-1)?.id ?: nav[tab].id
             view.nextFocusDownId=items.getOrNull(index+1)?.id ?: view.id
         } }
-        left.forEachIndexed { i,v -> v.nextFocusLeftId=v.id; v.nextFocusRightId=right[i].id }
-        right.forEachIndexed { i,v -> v.nextFocusLeftId=left[i].id; v.nextFocusRightId=v.id }
+        // 两列行数不同，左右配对只覆盖较短的一列，其余保持自身。
+        left.forEachIndexed { i,v -> v.nextFocusLeftId=v.id; v.nextFocusRightId=right.getOrNull(i)?.id ?: v.id }
+        right.forEachIndexed { i,v -> v.nextFocusLeftId=left.getOrNull(i)?.id ?: v.id; v.nextFocusRightId=v.id }
         nav.forEach { it.nextFocusDownId=qualityButton.id }
         parent.addView(text("红果 TV  /  ${BuildConfig.VERSION_NAME}    ·    收藏与进度保存在本机",12f,muted).apply { setPadding(dp(2),dp(18),0,dp(10)) })
         nav[tab].requestFocus()
@@ -1134,6 +1140,43 @@ class MainActivity: Activity() {
             if(anchor.isAttachedToWindow) { anchor.requestFocus(); if(inPlayer) showHud() }
         }
         dialog.show(); dialog.listView.setSelection(selected); dialog.listView.requestFocus()
+    }
+    private fun accountLabel(): String {
+        val name=accountStore.nickname
+        return if(name.isEmpty()) "扫码登录  ·  未登录" else "账号  ·  $name"
+    }
+    /**
+     * 账号入口。
+     *
+     * 未登录时走抖音扫码；已登录时给出重新登录与退出。
+     * 这里只呈现登录态，不等同于已能读取红果短剧的收藏/历史——
+     * 那些列表是否可读要以登录后的实测结果为准。
+     */
+    private fun showAccount(anchor: TextView) {
+        val name=accountStore.nickname
+        if(name.isEmpty()) {
+            tvTools.accountLogin(accountSession,anchor) { nickname ->
+                accountStore.nickname=nickname
+                if(anchor.isAttachedToWindow) anchor.text=accountLabel()
+                Toast.makeText(this,"已登录：$nickname",Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        tvTools.choose("账号  ·  $name",listOf("重新扫码登录","退出登录"),anchor,{ index ->
+            if(index==0) {
+                tvTools.accountLogin(accountSession,anchor) { nickname ->
+                    accountStore.nickname=nickname
+                    if(anchor.isAttachedToWindow) anchor.text=accountLabel()
+                    Toast.makeText(this,"已登录：$nickname",Toast.LENGTH_LONG).show()
+                }
+            } else {
+                tvTools.confirm("退出登录","退出后本机保存的会话会被清除，收藏与播放记录不受影响。",anchor) {
+                    accountSession.signOut(); accountStore.clearNickname()
+                    if(anchor.isAttachedToWindow) anchor.text=accountLabel()
+                    Toast.makeText(this,"已退出登录",Toast.LENGTH_SHORT).show()
+                }
+            }
+        })
     }
     private fun showQualityPicker(anchor: TextView,inPlayer: Boolean) {
         val options=PlaybackQuality.options

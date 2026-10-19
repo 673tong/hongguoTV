@@ -16,6 +16,7 @@ import android.widget.*
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.hongguotv.core.EpisodeTarget
+import com.hongguotv.core.AccountSession
 import com.hongguotv.core.PhoneSearchServer
 import com.hongguotv.core.LibraryTransferServer
 import com.hongguotv.core.BackupData
@@ -127,8 +128,84 @@ class TvTools(private val activity: Activity) {
             } catch(_: Exception) { main.post { if(dialog===next) status.text="无法开启手机输入，请检查网络后重试。" } }
         }
     }
-    fun libraryTransfer(backup: String,anchor: View?,restore: (BackupData,Boolean)->Unit) {
-        val connectivity=activity.getSystemService(ConnectivityManager::class.java)
+    /**
+     * 抖音扫码登录。
+     *
+     * 二维码由 passport 直接下发（base64 PNG），本地只负责显示与轮询；
+     * 关闭窗口即停止轮询，不会在后台继续请求。
+     */
+    fun accountLogin(session: AccountSession,anchor: View?,onDone: (String)->Unit) {
+        val content=column()
+        val image=ImageView(activity).apply { contentDescription="登录二维码"; visibility=View.GONE }
+        val status=label("正在获取二维码…")
+        val tip=label("用抖音 App 扫描上方二维码，并在手机上确认登录。",13f).apply { setTextColor(Color.LTGRAY) }
+        val row=LinearLayout(activity).apply { gravity=Gravity.CENTER_VERTICAL }
+        row.addView(image,LinearLayout.LayoutParams(dp(210),dp(210)))
+        row.addView(column().apply { addView(status); addView(tip) },LinearLayout.LayoutParams(0,-2,1f))
+        content.addView(row)
+        val next=AlertDialog.Builder(activity).setTitle("扫码登录")
+            .setView(content).setNegativeButton("关闭",null)
+            .setNeutralButton("刷新二维码",null).create()
+        open(next,anchor)
+        val alive=java.util.concurrent.atomic.AtomicBoolean(true)
+        next.setOnDismissListener {
+            alive.set(false); if(dialog===next) { phone?.close(); phone=null; dialog=null }
+            if(anchor?.isAttachedToWindow==true) anchor.requestFocus()
+        }
+        fun poll(token: String) {
+            worker.execute {
+                var loggedIn=false
+                while(alive.get() && !loggedIn) {
+                    val progress=try { session.poll(token) } catch(_: Exception) { AccountSession.Progress(AccountSession.Status.UNKNOWN) }
+                    when(progress.status) {
+                        AccountSession.Status.WAITING -> main.post { if(alive.get()) status.text="等待扫码…" }
+                        AccountSession.Status.SCANNED -> main.post { if(alive.get()) status.text="已扫码，请在手机上确认登录" }
+                        AccountSession.Status.CONFIRMED -> {
+                            loggedIn=true
+                            val name=progress.nickname.ifEmpty { session.profile()?.nickname.orEmpty() }
+                            main.post { if(alive.get()) { next.dismiss(); onDone(name.ifEmpty { "已登录" }) } }
+                        }
+                        AccountSession.Status.EXPIRED -> {
+                            main.post { if(alive.get()) { status.text="二维码已过期"; tip.text="点下方「刷新二维码」重新获取。" } }
+                            return@execute
+                        }
+                        AccountSession.Status.CANCELLED -> {
+                            main.post { if(alive.get()) { status.text="已在手机上取消登录"; tip.text="可重新扫码。" } }
+                            return@execute
+                        }
+                        else -> main.post { if(alive.get()) status.text="等待扫码…" }
+                    }
+                    if(!alive.get() || loggedIn) break
+                    try { Thread.sleep(AccountSession.pollIntervalMillis()) } catch(_: InterruptedException) { break }
+                }
+            }
+        }
+        fun load() {
+            status.text="正在获取二维码…"; image.visibility=View.GONE
+            worker.execute {
+                try {
+                    val qr=session.requestQr()
+                    val bitmap=runCatching {
+                        val bytes=android.util.Base64.decode(qr.pngBase64,android.util.Base64.DEFAULT)
+                        android.graphics.BitmapFactory.decodeByteArray(bytes,0,bytes.size)
+                    }.getOrNull() ?: throw IllegalStateException("二维码图片无法解析")
+                    main.post {
+                        if(!alive.get()) return@post
+                        image.setImageBitmap(bitmap); image.visibility=View.VISIBLE
+                        status.text=qr.hint
+                        poll(qr.token)
+                    }
+                } catch(e: Exception) {
+                    main.post { if(alive.get()) { status.text=e.message ?: "无法获取二维码，请重试"; tip.text="可以点下方「刷新二维码」重试。" } }
+                }
+            }
+        }
+        next.setOnShowListener {
+            next.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener { load() }
+            load()
+        }
+    }
+    fun libraryTransfer(backup: String,anchor: View?,restore: (BackupData,Boolean)->Unit) {        val connectivity=activity.getSystemService(ConnectivityManager::class.java)
         val network=connectivity.activeNetwork; val capabilities=connectivity.getNetworkCapabilities(network)
         val address=connectivity.getLinkProperties(network)?.linkAddresses?.map { it.address }?.firstOrNull { it is Inet4Address && it.isSiteLocalAddress }?.hostAddress
         if(address==null || capabilities==null || !(capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET))) {

@@ -2,7 +2,29 @@
 
 用户目标：用本人抖音账号登录红果，在电视端同步红果收藏、观看历史及续播位置。保持用户只安装 APK、无需自行部署服务。
 
-## 当前结论
+## 2026-10-19 更新：扫码登录已落地，账号数据仍受限
+
+`AccountSession`（core）已实现抖音扫码登录：`requestQr()` 取二维码 PNG 与 `token`，`poll()` 轮询
+`check_qrconnect`，`confirmed` 后跟随 `redirect_url` 落会话 Cookie，`profile()` 用
+`passport/account/info/v2` 校验并取昵称。会话只写入应用私有 SharedPreferences，不进备份包。
+自检命令：`./gradlew :core:run --args="--qrlogin"`（实测拿到二维码、轮询 `WAITING`、捕获 CSRF Cookie）。
+
+实测边界（决定了这一版只能做"登录骨架"）：
+
+| 目标 | 结果 |
+| --- | --- |
+| `get_qrcode?aid=2503&service=fanqienovel.com&next=/` | 200，返回真实二维码 PNG（抖音 App 扫码） |
+| `get_qrcode?aid=8704&service=…`（红果短剧） | 错误码 16「该应用无权限」，红果 App 不做网页签发 |
+| `hongguoduanju.com` 用户中心 | 不存在：`/login`、`/user`、`/api/user/*` 全部 404 |
+| `fanqienovel.com` 短剧频道 | 不存在，该站只有小说 |
+| `passport/account/info/v2` 未登录 | 错误码 13「会话过期，请重新登录」，可用于登录态判定 |
+
+因此：**抖音扫码拿到的是网页域会话（aid=2503），它绑定的是番茄/木叶账号，不是红果短剧 App
+（aid=8704）的会话。** 红果短剧自身的收藏与观看历史没有可用接口，不能靠这条链路直接读取。
+下一步必须用真实账号扫码后实测能读到哪些列表（候选：番茄书架、阅读历史、以及用该会话调用
+`reading.snssdk.com` 侧的接口），读到什么再做什么，不预先承诺。
+
+## 旧结论（仍然成立的部分）
 
 本轮没有实现红果登录或云端同步。缺少经过验证的红果用户授权、账号映射、收藏和进度读写接口；普通抖音 OAuth 授权不能作为这些权限已获授予的证据。不得将头像或昵称获取成功标记为“红果已登录/已同步”。
 

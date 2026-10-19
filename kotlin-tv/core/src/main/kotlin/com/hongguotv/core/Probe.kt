@@ -2,6 +2,27 @@ package com.hongguotv.core
 
 fun main(args: Array<String>) {
     val repository=ContentRepository()
+    if(args.contains("--qrlogin")) {
+        // 扫码登录的连通性自检：只取二维码并轮询几次，不打印任何凭证内容。
+        val session=AccountSession(repository.http, object: AccountSession.SessionStore {
+            private var saved=emptyMap<String,String>()
+            override fun read()=saved
+            override fun write(cookies: Map<String,String>) { saved=cookies }
+        })
+        try {
+            val qr=session.requestQr()
+            println("qrToken=${qr.token.take(8)}…; pngBase64=${qr.pngBase64.length}B; expiresIn=${(qr.expiresAt-System.currentTimeMillis())/1000}s")
+            println("hint=${qr.hint}")
+            repeat(2) {
+                println("poll[$it]=${session.poll(qr.token).status}")
+                Thread.sleep(AccountSession.pollIntervalMillis())
+            }
+            println("loggedIn=${session.isLoggedIn()}; cookieNames=${session.cookieNames()}")
+        } finally {
+            repository.http.connectionPool.evictAll(); repository.http.dispatcher.executorService.shutdown()
+        }
+        return
+    }
     if(args.contains("--ranking")) {
         try {
             val first=repository.comicRanking()
