@@ -23,7 +23,9 @@ data class AppUpdate(val versionCode: Long, val versionName: String, val minSdk:
         const val REPOSITORY = "673tong/hongguoTV"
         const val RELEASES = "https://github.com/$REPOSITORY/releases"
         const val MAX_APK_BYTES = 80L * 1024 * 1024
+        // 两种历史命名都接受：旧 CI 的 hongguotv-kotlin-<ver>-android8.apk 与手工发布的 hongguoTV-<ver>.apk。
         val APK_NAME = Regex("hongguotv-kotlin-([0-9][0-9A-Za-z.+-]{0,80})-android8\\.apk")
+        val APK_NAME_SIMPLE = Regex("hongguoTV-([0-9][0-9A-Za-z.+-]{0,80})\\.apk")
 
         /** Parse e.g. "0.10.1" into comparable major/minor/patch triple. */
         fun compareSemver(a: String, b: String): Int {
@@ -45,7 +47,7 @@ data class AppUpdate(val versionCode: Long, val versionName: String, val minSdk:
             for (i in 0 until assets.length()) {
                 val asset = assets.optJSONObject(i) ?: continue
                 val name = asset.optString("name").orEmpty()
-                val match = APK_NAME.matchEntire(name) ?: continue
+                val match = APK_NAME.matchEntire(name) ?: APK_NAME_SIMPLE.matchEntire(name) ?: continue
                 val size = asset.optLong("size", 0)
                 require(size in 1..MAX_APK_BYTES) { "安装包大小异常" }
                 val version = match.groupValues[1]

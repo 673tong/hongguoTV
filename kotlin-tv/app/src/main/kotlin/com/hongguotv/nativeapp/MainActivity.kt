@@ -1071,6 +1071,11 @@ class MainActivity: Activity() {
         val options=row().apply { setPadding(0,dp(8),0,0) }; controls.addView(options)
         lateinit var episodes: TextView
         episodes=addButton(options,"选集") { showEpisodePanel(episodes) }
+        // 倍速与清晰度是高频操作，直接平铺在面板里，不必先进"播放设置"二级菜单。
+        lateinit var speed: TextView
+        speed=addButton(options,"倍速 ${PlaybackSpeed.label(library.playbackSpeed)}") { showSpeedPicker(speed) }
+        lateinit var quality: TextView
+        quality=addButton(options,"清晰度 ${library.maxQuality}P") { showQualityPicker(quality,true) }
         lateinit var more: TextView
         more=addButton(options,"播放设置") {
             tvTools.choose("播放设置",listOf("倍速 ${PlaybackSpeed.label(library.playbackSpeed)}","清晰度 ${library.maxQuality}P","画面 ${library.frameMode.label}","定时 ${sleepTimer.label()}","从头播放"),more,{ choice ->

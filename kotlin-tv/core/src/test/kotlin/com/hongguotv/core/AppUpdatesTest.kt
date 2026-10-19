@@ -39,6 +39,17 @@ class AppUpdatesTest {
         // Traversal-style names simply do not match the APK regex and yield no update.
         assertThrows(IOException::class.java) { AppUpdate.parse(releaseJson(name = "../../bad.apk").toString()) }
     }
+
+    @Test fun simpleReleaseAssetNamingIsAlsoAccepted() {
+        val update = AppUpdate.parse(releaseJson(name = "hongguoTV-0.9.3.apk", tag = "093").toString())
+        assertEquals("0.9.3", update.versionName); assertEquals("093", update.tag)
+        assertEquals("hongguoTV-0.9.3.apk", update.fileName)
+        assertEquals("https://github.com/673tong/hongguoTV/releases/download/093/hongguoTV-0.9.3.apk", update.downloadUrl)
+        assertTrue(update.newerThan(11, 26, "0.9.2")); assertFalse(update.newerThan(11, 26, "0.9.3"))
+        // 大小写必须与发布附件完全一致，避免宽松匹配吃进任意文件。
+        assertThrows(IOException::class.java) { AppUpdate.parse(releaseJson(name = "hongguotv-0.9.3.apk").toString()) }
+        assertThrows(IOException::class.java) { AppUpdate.parse(releaseJson(name = "hongguoTV-0.9.3.apk.bak").toString()) }
+    }
     @Test fun enforceSizeBounds() {
         assertThrows(IllegalArgumentException::class.java) { AppUpdate.parse(releaseJson(size = 0).toString()) }
         assertThrows(IllegalArgumentException::class.java) { AppUpdate.parse(releaseJson(size = -1).toString()) }
