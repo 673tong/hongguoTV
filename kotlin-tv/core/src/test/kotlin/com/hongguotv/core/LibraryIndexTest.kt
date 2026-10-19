@@ -88,4 +88,18 @@ class LibraryIndexTest {
         assertTrue(state.history().isEmpty())
         assertEquals(0, state.updatedFavorites())
     }
+
+    @Test fun `quality preference survives a restart and falls back safely`() {
+        // 用户在播放面板选了 720：写盘是整型，重启后必须还原成 720（不能掉回默认 1080）。
+        for (picked in PlaybackQuality.options) {
+            val restarted = LibraryDisk.decode(mapOf("quality" to picked))
+            assertEquals("$picked 应原样恢复", picked, restarted.settings.quality)
+        }
+        // 老版本没写过这个键、或写入越界/脏值时，统一退回 1080，绝不抛异常导致启动失败。
+        assertEquals(1080, LibraryDisk.decode(emptyMap<String, Any>()).settings.quality)
+        assertEquals(1080, LibraryDisk.decode(mapOf("quality" to 0)).settings.quality)
+        assertEquals(1080, LibraryDisk.decode(mapOf("quality" to 2160)).settings.quality)
+        // 类型不符（历史脏数据）时也走默认值，避免拖垮启动。
+        assertEquals(1080, LibraryDisk.decode(mapOf("quality" to "720")).settings.quality)
+    }
 }
