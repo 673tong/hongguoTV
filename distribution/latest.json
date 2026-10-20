@@ -1,0 +1,10 @@
+{
+  "versionName": "0.9.6",
+  "versionCode": 15,
+  "tag": "096",
+  "fileName": "hongguotv-kotlin-0.9.6-android8.apk",
+  "size": 2769898,
+  "sha256": "61b2931a8e8d1dae3d01a8c097d110db263575886bba33a7d3e68b9565420587",
+  "minSdk": 26,
+  "notes": "0.9.6：更新检查/下载支持国内镜像回退；播放失败新增尝试 360P；含 0.9.4 的 720p CENC 解密与 0.9.5 的抖音扫码登录。"
+}

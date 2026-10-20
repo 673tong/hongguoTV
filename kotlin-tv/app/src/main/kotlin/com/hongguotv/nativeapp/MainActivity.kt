@@ -995,6 +995,7 @@ class MainActivity: Activity() {
         val actions=row(); controls.addView(actions)
         addButton(actions,"立即重试") { playEpisode(episodeIndex,retryPosition,retryAutoplay) }.requestFocus()
         addButton(actions,"尝试 720P") { library.maxQuality=720; playEpisode(episodeIndex,retryPosition,retryAutoplay) }
+        addButton(actions,"尝试 360P") { library.maxQuality=360; playEpisode(episodeIndex,retryPosition,retryAutoplay) }
         addButton(actions,"返回选集") { returnToDetail(true) }
         if(retryable && !sleepStopped) {
             addButton(controls,"停止自动重试") { cancelRecovery(); playbackText.text="自动重试已停止，观看位置已保留。" }

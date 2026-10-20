@@ -38,6 +38,24 @@ data class AppUpdate(val versionCode: Long, val versionName: String, val minSdk:
             return 0
         }
 
+        /**
+         * Parse the committed mirror fallback manifest (distribution/latest.json on the default branch).
+         * Same fields the release API would give us, minus anything we cannot verify ourselves.
+         */
+        fun parseManifest(json: String): AppUpdate {
+            val o = try { JSONObject(json) } catch (_: Exception) { throw IOException("更新信息格式不正确") }
+            val version = o.optString("versionName").orEmpty()
+            val tag = o.optString("tag").orEmpty()
+            val fileName = o.optString("fileName").orEmpty()
+            require(version.isNotEmpty() && tag.isNotEmpty() && fileName.isNotEmpty()) { "更新信息不完整" }
+            (APK_NAME.matchEntire(fileName) ?: APK_NAME_SIMPLE.matchEntire(fileName))
+                ?: throw IOException("更新清单中的安装包命名异常")
+            val size = o.optLong("size", 0)
+            require(size in 1..MAX_APK_BYTES) { "安装包大小异常" }
+            return AppUpdate(0L, version, o.optInt("minSdk", 26), tag, fileName, size,
+                o.optString("sha256").orEmpty(), o.optString("notes").orEmpty().take(1500))
+        }
+
         /** Parse GitHub API `/releases/latest` JSON; pick the first TV APK asset. sha256 is unknown for raw releases. */
         fun parse(json: String): AppUpdate {
             val o = JSONObject(json)
@@ -90,38 +108,89 @@ object UpdateFiles {
     }
 }
 
+/** Mirror prefixes tested against this project's API + release assets; each just forwards the full GitHub URL. */
+object UpdateMirrors {
+    /** Order is priority. gh-proxy also proxies api.github.com; ghfast only proxies github.com assets. */
+    val PREFIXES = listOf("https://gh-proxy.com/", "https://ghfast.top/")
+    /** Committed manifest on the default branch, served by jsDelivr's China-reachable CDN as the last resort. */
+    fun manifestUrl(repository: String = AppUpdate.REPOSITORY) = "https://cdn.jsdelivr.net/gh/$repository@main/distribution/latest.json"
+    fun apiUrl(repository: String = AppUpdate.REPOSITORY) = "https://api.github.com/repos/$repository/releases/latest"
+    val ALLOWED_HOSTS = setOf(
+        "api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com",
+        "gh-proxy.com", "ghfast.top", "cdn.jsdelivr.net",
+    )
+}
+
 class AppUpdateRepository : java.io.Closeable {
     private val http = OkHttpClient.Builder().connectTimeout(10, TimeUnit.SECONDS).readTimeout(20, TimeUnit.SECONDS)
         .callTimeout(5, TimeUnit.MINUTES).addNetworkInterceptor { chain ->
             val url = chain.request().url
-            // Follow GitHub's API + CDN redirects, never cleartext or arbitrary manifest-provided hosts.
-            if (url.scheme != "https" || url.host !in setOf("api.github.com", "github.com", "release-assets.githubusercontent.com", "objects.githubusercontent.com"))
+            // GitHub's API + CDN, plus the mirror prefixes and the jsDelivr manifest host.
+            // Mirrors only ever forward fixed GitHub URLs built in this file, never manifest-provided hosts.
+            if (url.scheme != "https" || url.host !in UpdateMirrors.ALLOWED_HOSTS)
                 throw IOException("更新下载地址不受支持")
             chain.proceed(chain.request())
         }.build()
     private fun request(url: String) = Request.Builder().url(url).header("User-Agent", "HongguoTV-Updater")
         .header("Accept", "application/vnd.github+json").header("Cache-Control", "no-cache").build()
+
+    /** 直连 GitHub 常年超时（国内网络），逐个源回退直到拿到可用清单。 */
+    private fun fetchManifest(): String {
+        val sources = buildList {
+            add(UpdateMirrors.apiUrl())
+            UpdateMirrors.PREFIXES.forEach { prefix -> add(prefix + UpdateMirrors.apiUrl()) }
+            add(UpdateMirrors.manifestUrl())
+        }
+        var lastError: Exception? = null
+        for (url in sources) {
+            try {
+                val call = http.newCall(request(url))
+                call.timeout().timeout(25, TimeUnit.SECONDS)
+                return call.execute().use { response ->
+                    if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
+                    val bytes = response.body?.byteStream()?.use { input ->
+                        val out = ByteArrayOutputStream(); val buffer = ByteArray(4096)
+                        while (true) { val n = input.read(buffer); if (n < 0) break; if (out.size() + n > 262144) throw IOException("更新信息过大"); out.write(buffer, 0, n) }
+                        out.toByteArray()
+                    } ?: throw IOException("更新信息为空")
+                    bytes.toString(Charsets.UTF_8)
+                }
+            } catch (e: Exception) { lastError = e }
+        }
+        throw IOException("无法连接更新服务器（GitHub 与镜像均不可达），请稍后重试", lastError)
+    }
     fun latest(): AppUpdate {
-        val call = http.newCall(request("https://api.github.com/repos/${AppUpdate.REPOSITORY}/releases/latest"))
-        call.timeout().timeout(25, TimeUnit.SECONDS)
-        return call.execute().use { response ->
-            if (!response.isSuccessful) throw IOException(if (response.code == 404) "尚无可用的自动更新版本" else "无法检查更新，请稍后重试")
-            val bytes = response.body?.byteStream()?.use { input ->
-                val out = ByteArrayOutputStream(); val buffer = ByteArray(4096)
-                while (true) { val n = input.read(buffer); if (n < 0) break; if (out.size() + n > 262144) throw IOException("更新信息过大"); out.write(buffer, 0, n) }
-                out.toByteArray()
-            } ?: throw IOException("更新信息为空")
-            try { AppUpdate.parse(bytes.toString(Charsets.UTF_8)) } catch (_: IOException) { throw IOException("更新信息格式不正确") } catch (_: Exception) { throw IOException("更新信息格式不正确") }
+        val body = fetchManifest()
+        return try { AppUpdate.parse(body) } catch (e: Exception) {
+            try { AppUpdate.parseManifest(body) } catch (e2: Exception) {
+                // 两个解析都失败说明拿到的既不是 API JSON 也不是清单 JSON（如镜像返回了错误页）。
+                throw IOException("更新信息格式不正确", e2)
+            }
         }
     }
     fun download(update: AppUpdate, file: File, progress: (Int) -> Unit) {
         if (UpdateFiles.verify(file, update)) return
-        http.newCall(request(update.downloadUrl)).execute().use { response ->
-            if (!response.isSuccessful) throw IOException("安装包下载失败，请稍后重试")
-            val body = response.body ?: throw IOException("安装包为空")
-            if (body.contentLength() >= 0 && body.contentLength() != update.size) throw IOException("安装包长度异常")
-            body.byteStream().use { UpdateFiles.receive(it, file, update, progress) }
+        val urls = buildList {
+            add(update.downloadUrl)
+            UpdateMirrors.PREFIXES.forEach { prefix -> add(prefix + update.downloadUrl) }
         }
+        var lastError: Exception? = null
+        for (url in urls) {
+            try {
+                http.newCall(request(url)).execute().use { response ->
+                    if (!response.isSuccessful) throw IOException("安装包下载失败（HTTP ${response.code}）")
+                    val body = response.body ?: throw IOException("安装包为空")
+                    if (body.contentLength() >= 0 && body.contentLength() != update.size) throw IOException("安装包长度异常")
+                    body.byteStream().use { UpdateFiles.receive(it, file, update, progress) }
+                }
+                return
+            } catch (e: Exception) {
+                // 用户主动取消不能被镜像重试吞掉。
+                if (e.message == "下载已取消" || Thread.currentThread().isInterrupted) throw e
+                lastError = e
+            }
+        }
+        throw lastError ?: IOException("安装包下载失败，请稍后重试")
     }
     fun cancel() = http.dispatcher.cancelAll()
     override fun close() { cancel(); http.connectionPool.evictAll(); http.dispatcher.executorService.shutdown() }

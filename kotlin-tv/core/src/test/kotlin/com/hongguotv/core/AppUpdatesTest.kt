@@ -4,6 +4,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.IOException
@@ -54,6 +55,42 @@ class AppUpdatesTest {
         assertThrows(IllegalArgumentException::class.java) { AppUpdate.parse(releaseJson(size = 0).toString()) }
         assertThrows(IllegalArgumentException::class.java) { AppUpdate.parse(releaseJson(size = -1).toString()) }
         assertThrows(IllegalArgumentException::class.java) { AppUpdate.parse(releaseJson(size = AppUpdate.MAX_APK_BYTES+1).toString()) }
+    }
+    @Test fun parsesCommittedMirrorManifest() {
+        val json = JSONObject()
+            .put("versionName", "0.9.6").put("tag", "096")
+            .put("fileName", "hongguotv-kotlin-0.9.6-android8.apk").put("size", bytes.size.toLong())
+            .put("minSdk", 26).put("notes", "mirror fallback")
+        val update = AppUpdate.parseManifest(json.toString())
+        assertEquals("0.9.6", update.versionName); assertEquals("096", update.tag)
+        assertEquals("hongguotv-kotlin-0.9.6-android8.apk", update.fileName)
+        assertEquals("https://github.com/673tong/hongguoTV/releases/download/096/hongguotv-kotlin-0.9.6-android8.apk", update.downloadUrl)
+        assertTrue(update.newerThan(13, 26, "0.9.4")); assertFalse(update.newerThan(15, 26, "0.9.6"))
+    }
+    @Test fun mirrorManifestRejectsIncompleteOrTamperedData() {
+        // 缺字段、坏命名、大小越界、非 JSON 一律拒绝，避免镜像返回错误页被当成更新。
+        assertThrows(Exception::class.java) { AppUpdate.parseManifest("{\"versionName\":\"0.9.6\"}") }
+        assertThrows(Exception::class.java) {
+            AppUpdate.parseManifest(JSONObject().put("versionName", "0.9.6").put("tag", "096")
+                .put("fileName", "evil.html").put("size", 10).toString())
+        }
+        assertThrows(Exception::class.java) {
+            AppUpdate.parseManifest(JSONObject().put("versionName", "0.9.6").put("tag", "096")
+                .put("fileName", "hongguotv-kotlin-0.9.6-android8.apk").put("size", 0).toString())
+        }
+        assertThrows(Exception::class.java) { AppUpdate.parseManifest("<html>Bad Gateway</html>") }
+    }
+    @Test fun mirrorPrefixesAndManifestUrlAreWellFormed() {
+        assertEquals(listOf("https://gh-proxy.com/", "https://ghfast.top/"), UpdateMirrors.PREFIXES)
+        val api = UpdateMirrors.apiUrl()
+        assertEquals("https://api.github.com/repos/673tong/hongguoTV/releases/latest", api)
+        assertEquals("https://cdn.jsdelivr.net/gh/673tong/hongguoTV@main/distribution/latest.json", UpdateMirrors.manifestUrl())
+        // 每个镜像前缀拼上 GitHub URL 后必须仍在白名单主机内。
+        UpdateMirrors.PREFIXES.forEach { prefix ->
+            val host = prefix.toHttpUrlOrNull()?.host ?: fail("镜像前缀不是合法 URL: $prefix")
+            assertTrue(host in UpdateMirrors.ALLOWED_HOSTS)
+        }
+        assertTrue("cdn.jsdelivr.net" in UpdateMirrors.ALLOWED_HOSTS)
     }
     @Test fun verifiedDownloadAtomicallyReplacesOldFile() = withFile { file ->
         file.writeText("previous"); val progress = mutableListOf<Int>()
